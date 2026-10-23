@@ -1,6 +1,7 @@
 import os, tempfile, json
 from pathlib import Path
 from fastapi import HTTPException
+import httpx
 import pytest
 
 # Cross-platform safe temp directory for tests
@@ -11,7 +12,7 @@ os.environ['GENERATIONS_PATH'] = str(TEST_GEN)
 os.environ.pop('GROQ_API_KEY', None)
 
 from fastapi.testclient import TestClient
-from app.main import app
+from app.main import app, call_llm
 from app.db import Base, engine
 
 ROOT = Path(__file__).parents[1]
@@ -26,7 +27,8 @@ def ingest(path, version):
     with open(path, 'rb') as f:
         return client.post('/ingest', params={'version': version}, files={'file': (Path(path).name, f, 'application/pdf')})
 
-def test_v1_v2_versioning_compare_and_pinned_selection():
+def test_v1_v2_versioning_compare_and_pinned_selection(monkeypatch):
+    monkeypatch.delenv('GROQ_API_KEY', raising=False)
     reset()
     a = ingest(ROOT / 'data' / 'ct200_manual.pdf', 1)
     b = ingest(ROOT / 'data' / 'ct200_manual_v2.pdf', 2)
@@ -203,3 +205,128 @@ def test_lifecycle_staleness_reporting_after_v2_ingestion(monkeypatch):
     assert trace2['is_stale'] is True
     assert trace2['latest_version'] == 2
     assert any('300' in t for t in trace2['sources'][0]['substantive_triggers'])
+
+    # 7. Also verify retrieval by node_id returns staleness
+    node_retrieval = client.get('/generations', params={'node_id': found['id']}).json()
+    assert node_retrieval['count'] >= 1
+    assert node_retrieval['generations'][0]['traceability']['is_stale'] is True
+
+@pytest.mark.anyio
+async def test_call_llm_retries_and_fails_on_malformed_json(monkeypatch):
+    monkeypatch.setenv('GROQ_API_KEY', 'test_key_placeholder')
+    attempts = []
+
+    class MockResponse:
+        def raise_for_status(self): pass
+        def json(self): return {'choices': [{'message': {'content': 'invalid json {'}}]}
+
+    async def mock_post(*args, **kwargs):
+        attempts.append(1)
+        return MockResponse()
+
+    monkeypatch.setattr('httpx.AsyncClient.post', mock_post)
+    with pytest.raises(HTTPException) as exc:
+        await call_llm("sample manual text")
+    assert exc.value.status_code == 502
+    assert len(attempts) == 2
+
+@pytest.mark.anyio
+async def test_call_llm_retries_and_fails_on_invalid_count(monkeypatch):
+    monkeypatch.setenv('GROQ_API_KEY', 'test_key_placeholder')
+    attempts = []
+
+    class MockResponse:
+        def raise_for_status(self): pass
+        def json(self):
+            # Only 1 test case (< 3 minimum required)
+            return {'choices': [{'message': {'content': json.dumps({
+                'test_cases': [{
+                    'title': 'Test 1',
+                    'rationale': 'R1',
+                    'source_reference': 'S1',
+                    'preconditions': ['P1'],
+                    'steps': ['Step 1'],
+                    'expected_result': 'Result 1',
+                    'severity': 'low'
+                }]
+            })}}]}
+
+    async def mock_post(*args, **kwargs):
+        attempts.append(1)
+        return MockResponse()
+
+    monkeypatch.setattr('httpx.AsyncClient.post', mock_post)
+    with pytest.raises(HTTPException) as exc:
+        await call_llm("sample manual text")
+    assert exc.value.status_code == 502
+    assert len(attempts) == 2
+
+@pytest.mark.anyio
+async def test_call_llm_recovers_on_second_attempt(monkeypatch):
+    monkeypatch.setenv('GROQ_API_KEY', 'test_key_placeholder')
+    attempts = []
+
+    class MockFailResponse:
+        def raise_for_status(self): pass
+        def json(self): return {'choices': [{'message': {'content': 'malformed'}}]}
+
+    class MockSuccessResponse:
+        def raise_for_status(self): pass
+        def json(self):
+            return {'choices': [{'message': {'content': json.dumps({
+                'test_cases': [
+                    {
+                        'title': f'TestCase {i}',
+                        'rationale': f'Rationale {i}',
+                        'source_reference': f'Section {i}',
+                        'preconditions': ['Precond'],
+                        'steps': ['Step 1', 'Step 2'],
+                        'expected_result': 'Expected outcome verified',
+                        'severity': 'medium'
+                    }
+                    for i in range(1, 4)
+                ]
+            })}}]}
+
+    async def mock_post(*args, **kwargs):
+        attempts.append(1)
+        if len(attempts) == 1:
+            return MockFailResponse()
+        return MockSuccessResponse()
+
+    monkeypatch.setattr('httpx.AsyncClient.post', mock_post)
+    output, attempt_num = await call_llm("sample manual text")
+    assert attempt_num == 2
+    assert len(output['test_cases']) == 3
+
+@pytest.mark.anyio
+async def test_call_llm_handles_provider_http_error(monkeypatch):
+    monkeypatch.setenv('GROQ_API_KEY', 'test_key_placeholder')
+    attempts = []
+
+    async def mock_post(*args, **kwargs):
+        attempts.append(1)
+        req = httpx.Request('POST', 'https://api.groq.com')
+        resp = httpx.Response(500, request=req)
+        raise httpx.HTTPStatusError("Internal Server Error", request=req, response=resp)
+
+    monkeypatch.setattr('httpx.AsyncClient.post', mock_post)
+    with pytest.raises(HTTPException) as exc:
+        await call_llm("sample manual text")
+    assert exc.value.status_code == 502
+    assert len(attempts) == 2
+
+@pytest.mark.skipif(not os.getenv('GROQ_API_KEY'), reason="GROQ_API_KEY not configured in environment")
+def test_live_groq_llm_smoke_test():
+    reset()
+    assert ingest(ROOT / 'data' / 'ct200_manual.pdf', 1).status_code == 200
+    found = client.get('/search', params={'q': 'Battery Life Under Typical Use', 'version': 1}).json()['results'][0]
+    selection = client.post('/selections', json={'name': 'Live Groq Test', 'version': 1, 'node_ids': [found['id']]}).json()
+    res = client.post(f"/selections/{selection['selection_id']}/generate")
+    assert res.status_code == 201
+    gen = res.json()['generation']
+    assert 3 <= len(gen['test_cases']) <= 5
+    for tc in gen['test_cases']:
+        assert tc['title'] and tc['steps'] and tc['expected_result'] and tc['severity']
+    assert gen['model'] and gen['provider'] == 'groq'
+
