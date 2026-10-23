@@ -1,78 +1,213 @@
-# CT-200 Parsing, Versioning & QA Traceability — Approach
+# CT-200 Parsing, Versioning & QA Traceability — Technical Approach & Design
 
-## 1. Scope and source inspection
+## 1. Scope and Source Inspection
 
-The parser targets the two supplied CT-200 PDFs rather than arbitrary PDFs. The accompanying assignment update explicitly says to work directly from the PDF. The v1 manual has 6 pages and v2 has 7 pages. Both contain a usable text layer plus visual tables. PyMuPDF is used for text extraction and layout spans; OCR is attempted only when a page yields no usable text, because OCR can introduce character and threshold errors unnecessarily when digital text is already available.
+This architecture targets the CardioTrack CT-200 Technical and User Manuals (`ct200_manual.pdf` [v1, 6 pages] and `ct200_manual_v2.pdf` [v2, 7 pages]).
+Per the assignment update (`IMPORTANT_ASSIGNMENT_UPDATE.txt`), input ingestion processes native PDFs directly rather than pre-rendered Markdown, reconstructing structural hierarchy, headings, sections, subsections, bullet/numbered lists, tables, and provenance metadata.
 
-Before finalizing the parser, the extracted structure was compared with the PDF's visible headings and page content. The parser retains body lines instead of silently dropping unfamiliar content. Table text remains in the owning section, but reliable cell reconstruction is not claimed where the PDF text layer exposes cells as separate positioned fragments.
+Extraction uses PyMuPDF (`fitz`) to extract structured text blocks, line bounding boxes, font sizes, and weight attributes. Digital text extraction is prioritized over OCR because both documents contain clean digital text layers; applying OCR indiscriminately introduces character substitutions, threshold distortion, and punctuation corruption. OCR via Tesseract is retained strictly as an automatic fallback when a page has no extractable digital text layer.
 
-## 2. Data model
+Extracted structure was systematically verified against the rendered PDF pages. The parser avoids silently inventing missing nodes or flattening unrecognized structural anomalies, instead surfacing them as auditable warnings attached directly to node records.
 
-- `Document`: stable identity for CardioTrack CT-200.
-- `DocumentVersion`: immutable version number, source filename and SHA-256 of the original PDF.
-- `Node`: version-specific ID, logical key, section number, heading, level, parent ID, body text, node type and content hash.
-- `Selection`: named selection pinned to one document version.
-- `SelectionItem`: exact node/version pair, source text snapshot and source hash.
-- `generated.json`: generation ID, selection ID, version, source node IDs/hashes/text snapshots, structured test cases, validation status and attempt count.
+---
 
-The SQL database is the source of truth for the tree and versioned selection records. A JSON document store is used for generated outputs because the assignment explicitly permits a justified JSON store. Writes use a temporary file followed by atomic replacement. This is not a multi-process transactional store and is a known prototype limitation.
+## 2. Data Model & Architecture
 
-## 3. Parsing and hierarchy reconstruction
+The system uses a hybrid storage model:
+- **Relational Source of Truth (SQLite via SQLAlchemy):** Manages the hierarchical document tree, version metadata, nodes, and pinned selections.
+- **Document Store (`generated.json`):** Persists generated QA test cases, model/provider provenance, and source text snapshots using atomic file replacement (`.tmp` write followed by `replace`).
 
-The parser extracts line text and font information from each PDF page. A short numbered line with a heading-like font/size is treated as a section heading. Other lines are appended to the active section body, preserving their order and line breaks. The title wraps across several lines and is merged into one document-title node.
+```mermaid
+erDiagram
+    Document ||--o{ DocumentVersion : contains
+    DocumentVersion ||--o{ Node : structures
+    DocumentVersion ||--o{ Selection : pins
+    Selection ||--o{ SelectionItem : snapshots
+    Selection ||--o{ GenerationRecord : produces
+    
+    Document {
+        int id PK
+        string name
+    }
+    DocumentVersion {
+        int id PK
+        int document_id FK
+        int version_number
+        string source_filename
+        string source_sha256
+    }
+    Node {
+        string id PK
+        string logical_key
+        int version_id FK
+        string parent_id FK
+        string heading
+        int level
+        string section_number
+        int page_start
+        int page_end
+        text body_text
+        text tables_json
+        string content_hash
+        text warnings_json
+    }
+    Selection {
+        string id PK
+        string name
+        int document_version_id FK
+        string created_at
+    }
+    SelectionItem {
+        int id PK
+        string selection_id FK
+        string node_id FK
+        int version_id FK
+        text source_text
+        string source_hash
+    }
+    GenerationRecord {
+        string generation_id PK
+        string selection_id FK
+        string model
+        string provider
+        list source_nodes
+        list test_cases
+        string validation
+        int llm_attempts
+        string created_at
+    }
+```
 
-Section numbering drives parent reconstruction. For a section like `2.1.1.1`, the parser looks for the nearest existing numbered ancestor. In these files, `2.1.1` is absent, so `2.1.1.1 Battery Life Under Typical Use` is attached to `2.1 General Specifications` and receives a warning. Source order is not sorted into numeric order: `3.4 Auto Shutoff` appears before `3.3 Result Display and Classification`, and this order is preserved and flagged.
+### Justification of the JSON Generation Store
+The assignment explicitly permits a justified JSON document store as an alternative to an external database like MongoDB. For a local single-process service, atomic file writing avoids external database daemon dependencies while providing a schema-free document model for nested LLM test cases and source snapshot arrays.
 
-The manual contains repeated heading text `Error Codes` in sections 4.2 and 7.1. These are separate logical nodes because their section numbers differ and their parents are different. The tree keeps node IDs distinct rather than merging based on title text.
+---
 
-Tables appear under `2.1 General Specifications` and `4.2 Error Codes`. PyMuPDF's line-based table detector reconstructs these as 8×2 and 6×3 tables in v1 (8×2 and 7×3 in v2). The parser filters smaller detector fragments contained within a larger table, stores the rows as structured JSON, and also appends a Markdown-like representation to the node text so selected source text includes table content. This works for the main tables in these supplied PDFs, but may fail on borderless tables or unusual merged cells; a future improvement would add more layout strategies and validate every cell against page images.
+## 3. Parsing and Hierarchy Reconstruction
 
-## 4. Structural cases found in the actual PDFs
+PDF extraction follows a multi-stage pipeline:
+1. **Span Analysis & Column Separation:** Spans within each text block are analyzed. Horizontal gaps greater than 35 points indicate distinct visual columns (e.g. table cells) and are preserved using pipe delimiters (` | `).
+2. **Heading vs Body Discrimination:** A line is classified as a section heading if:
+   - It matches `^\s*(\d+(?:\.\d+)*\.?)\s+(.+?)\s*$` (`SECTION_RE`).
+   - Line length is under 110 characters.
+   - It possesses heading weight (bold) or font size $\ge 12\text{pt}$.
+   Numbered items in lists (e.g. clinical classification items under `3.3`) have smaller non-bold body fonts and are preserved as body text.
+3. **Table Extraction & False-Fragment Filtering:** Visual tables with grid lines are detected using PyMuPDF's line-based table detector (`find_tables(strategy='lines')`). A geometric filter detects and removes sub-table fragments accidentally captured within larger tables. Reconstructed rows are stored both as structured JSON arrays and as Markdown tables appended to the owning section's body text.
+4. **Hierarchy Assembly & Parent Resolution:** Section numbers dictate tree structure. When a subsection level is skipped (e.g. `2.1.1.1` skipping `2.1.1`), the algorithm traverses backwards to the closest existing ancestor (`2.1`), attaches the node, and logs an explicit warning.
+5. **Page-Break Continuation Tracking:** When non-heading body text spans across multiple pages (e.g. Section 3.1 spanning pages 2–3 in v1; Section 4.3 spanning pages 4–5 in v2), the parser updates `page_end` and logs a `Page-break continuation` warning.
+6. **Title Multi-Line Merging:** Page 1 document title lines (`CardioTrack CT-200 Home Blood / Pressure Monitor — Technical & / User Manual`) are merged into a single canonical document title node.
 
-1. **Skipped numbering level:** `2.1.1.1 Battery Life Under Typical Use` has no visible `2.1.1` parent. It is attached to the nearest existing ancestor and a warning is emitted.
-2. **Out-of-order siblings:** `3.4 Auto Shutoff` occurs before `3.3 Result Display and Classification`. The parser preserves source order and emits a warning.
-3. **Repeated heading label:** `4.2 Error Codes` and `7.1 Error Codes` share a title but represent different sections and parents.
-4. **Tables:** the specifications and error-code tables are reconstructed into row/cell arrays; a filter removes false table fragments contained within the real table.
-5. **Title wraps across lines:** the document title spans multiple lines and must not be treated as body text.
-6. **v2 additions:** section `5.3 Data Export` and error code E6 are new in v2.
+---
 
-## 5. Version matching strategy
+## 4. Actual PDF Irregularities and Handling
 
-Logical matching uses the explicit section number (`SECTION:2.1.1.1`) rather than body hash or heading text. Therefore, changes to body wording do not create a new logical identity. Each ingestion still creates new version-specific node IDs and keeps the previous version intact. Content hashes are SHA-256 over normalized heading + body text and detect changes. The original PDF also receives a source SHA-256.
+The supplied manuals contain several real-world structural irregularities:
 
-This is a pragmatic path-based strategy. It breaks if section numbering changes, if two nodes use the same section number, or if a section is moved and renumbered. Unmatched nodes are reported as unresolved/removed rather than force-matched based on a fuzzy title. A future production matcher could combine normalized section path, heading similarity, parent identity, and manual review for ambiguous matches.
+| Irregularity | Occurrence in Source PDF | Engine Handling | Unit Test Verification |
+|---|---|---|---|
+| **Skipped Numbering Level** | Section `2.1.1.1 Battery Life Under Typical Use` appears directly under `2.1` without a `2.1.1` parent. | Attached to nearest existing numbered ancestor `2.1`; emits warning `Numbering skips 2.1.1; attached to nearest existing ancestor 2.1.` | `test_skipped_numbering_attaches_to_nearest_existing_ancestor` |
+| **Out-of-Order Sibling Sections** | Section `3.4 Auto Shutoff` appears *before* `3.3 Result Display and Classification` on page 3. | Preserves true document source order; emits warning `Section 3.4 appears before section 3.3 in source order.` | `test_out_of_order_sections_are_preserved_and_flagged` |
+| **Duplicate Heading Labels** | Section `4.2 Error Codes` and Section `7.1 Error Codes` share the identical title text. | Distinct `logical_key` (`SECTION:4.2` vs `SECTION:7.1`) and parent links (`4` vs `7`) preserve separation. | `test_duplicate_heading_text_remains_distinct_under_correct_parents` |
+| **Page-Break Continuations** | Section `3.1` spans across pages 2–3 (v1); Section `4.3` spans across pages 4–5 (v2); Section `6.1` spans across pages 5–6 (v2). | Continues body accumulation without splitting nodes; records `page_start`, `page_end`, and emits `Page-break continuation` warning. | `test_page_break_continuations_detected_and_flagged` |
+| **Multi-line Title Wrapping** | Title spans 3 visual lines on page 1. | Merges wrapped header spans into single level-0 document title node. | `test_multiline_title_merged_into_single_document_title` |
+| **Numbered List within Body** | Section `3.3` contains 5 clinical classification levels (`1. Normal`, `2. Elevated`, etc.). | Font size and weight discrimination retains list in `3.3` body text without misparsing as top-level sections 1–5. | `test_numbered_lists_preserved_as_body_not_nodes` |
+| **Table Cells & Additions** | Specifications table (8×2) and Error Codes table (6×3 in v1, 7×3 with E6 in v2). | Line-strategy detector extracts cells into structured JSON; containment filter prunes duplicate cell fragments. | `test_specification_and_error_code_tables_are_reconstructed_as_rows` |
 
-## 6. LLM prompt and structured-output strategy
+---
 
-The prompt instructs the model to use only the selected manual text, return 3–5 concrete test ideas, include a source-section reference, and avoid inventing specifications. Each test case requires title, requirement reference, preconditions, steps, expected result, and risk label. Pydantic validates the response shape and fields. The call uses JSON response mode when supported by Groq. On provider failure, malformed JSON, or schema validation failure, the system retries once with a correction instruction. If the second attempt fails, it returns HTTP 502 and does not persist a successful generation.
+## 5. Version Matching Strategy & Failure Modes
 
-The same selection is idempotent by default: if a generation already exists, the API returns it. `force_new=true` explicitly requests a new generation. This avoids accidental duplicate costs and makes retries predictable, while still allowing deliberate regeneration.
+- **Logical Key Matching:** Cross-version entity resolution uses normalized section paths (`SECTION:<num>`). Content changes do not alter logical identity: a modified requirement keeps its logical key while receiving a new version-specific node ID, content hash, and parent pointer.
+- **Node Classification:** The `/versions/compare` endpoint categorizes all nodes into four distinct lifecycle buckets:
+  - `added_nodes`: Present in new version, absent in older version (e.g. `SECTION:5.3 Data Export`).
+  - `removed_nodes`: Present in old version, absent in new version.
+  - `changed_nodes`: Present in both, but `content_hash` differs.
+  - `unchanged_nodes`: Identical `content_hash` in both versions.
+- **Failure Modes:**
+  1. *Section Renumbering:* If section `2.1.1.1` is renumbered to `2.1.2`, the matcher flags `2.1.1.1` as removed and `2.1.2` as added.
+  2. *Duplicate Numbering in Same Document:* Handled using occurrence suffixes (`SECTION:X::occurrence:2`).
+  3. *Unnumbered Documents:* Falls back to normalized heading slugs (`ROOT::<normalized_heading>`).
 
-## 7. Traceability and staleness
+---
 
-Selections store exact node/version pairs, source text and source hashes. Generation records repeat those snapshots so later ingestion cannot rewrite the provenance of a previous test case. Retrieval compares each saved source against the latest node with the same logical key. Hash equality is `current`; differences are classified as `wording_changed` or `substantive_change_suspected` using a simple similarity threshold; absent matches are `unresolved`.
+## 6. LLM Prompt, Schema Validation & Failure Policy
 
-These labels are triage hints only. The system cannot know whether a changed word is clinically important. In v1→v2, changes such as 300→250 battery cycles, 15%→10% low-battery threshold, 40→30 mmHg inflation increments, E3 2→1.5 seconds, and the addition of E6 are important to review. The exact content diff is exposed, but no automated claim is made that a generated test remains safe or valid. Human review is required.
+- **Configurable Provider:** Calls Groq's OpenAI-compatible chat API (`https://api.groq.com/openai/v1/chat/completions`) using `GROQ_API_KEY` and `GROQ_MODEL` (`llama-3.3-70b-versatile`).
+- **Prompt Strategy:** The prompt enforces strict grounding in the supplied manual text, prohibiting invented specifications or claims of regulatory compliance.
+- **Structured Output Schema:**
+  - `title`: Descriptive test title (4–180 chars).
+  - `rationale`: Justification explaining device/clinical risk addressed.
+  - `source_reference`: Traceable section and requirement citation.
+  - `preconditions`: List of prerequisites (min 1).
+  - `steps`: Concrete test execution steps (min 1).
+  - `expected_result`: Observable pass/fail criteria (min 5 chars).
+  - `severity`: Standardized triage label (`low`, `medium`, `high`, `critical`).
+- **Bounded Retries & Fail-Closed Error Policy:**
+  - If the LLM returns malformed JSON or fails Pydantic schema validation, the system executes one bounded correction attempt appending the exact validation error.
+  - If the retry fails or the provider times out/errors, the API immediately returns HTTP 502 Bad Gateway and **persists nothing**. Invalid test cases are never saved.
+- **Idempotency:** Re-submitting an existing selection ID returns the existing generation record by default, preventing accidental token usage and race conditions. Passing `force_new=true` explicitly generates and persists a new generation record.
 
-## 8. What the initial implementation failed to handle and how it improved
+---
 
-The first parser pass used a section-number expression that missed top-level headings written as `1. Device Overview` because the delimiter dot was not accounted for. Inspection of the extracted node list showed the first numbered section being absorbed into title text. The regex was updated to accept the optional delimiter and normalize the section number. A second inspection found the title split across three visual lines, so title continuation lines are now merged into one title node.
+## 7. Source Provenance & Substantive Staleness Design
 
-The parser initially also had no explicit warning for the 3.4/3.3 ordering anomaly. A source-order check and test were added. Tests are run with `python -m pytest -q` and are backed by both actual PDFs, not only synthetic text.
+- **Frozen Provenance:** Each selection captures frozen snapshots of source text, section numbers, and SHA-256 hashes at selection time. Generations duplicate these frozen snapshots alongside the LLM model name, provider, and timestamp.
+- **Retrieval-Time Comparison:** When `/generations` is queried, each frozen source snapshot is compared in real time against the latest version of that logical node.
+- **Substantive Change Detection Engine:** The engine (`detect_substantive_changes`) inspects diffs for:
+  - *Numerical Threshold Changes:* Regular expressions (`\b\d+(?:\.\d+)?%?\b`) extract numbers and percentages. Changes such as `300 -> 250` cycles or `15% -> 10%` low-battery threshold are detected and surfaced as explicit triggers.
+  - *Timing & Unit Modifiers:* Diffs in units (`mmHg`, `bpm`, `seconds`, `minutes`, `cycles`, `%`) are isolated (e.g. inflation increment `40 -> 30 mmHg`, E3 overpressure auto-deflation `2s -> 1.5s`).
+  - *Negation Terminology:* Diffs in restriction/negation words (`not`, `no`, `never`, `without`, `discontinue`, `cannot`).
+  - *Safety Terminology:* Diffs in safety-critical terms (`overpressure`, `alarm`, `safety`, `emergency`, `contraindication`, `fault`).
+- **Classification Hierarchy:**
+  - `current`: Content hash identical to latest version (`is_stale: false`).
+  - `substantive_change_suspected`: Numbers, units, timing, negation, or safety words changed, or text similarity < 90% (`is_stale: true`).
+  - `wording_changed`: Minor formatting or phrasing edits with no trigger words changed (`is_stale: true`).
+  - `unresolved`: Logical node removed or unmapped in latest version (`is_stale: true`).
+- **Clinical Disclaimer:** All comparison and staleness responses carry an explicit disclaimer stating that automated heuristic comparison cannot establish clinical or regulatory significance.
 
-## 9. Decision log
+---
 
-**1. Most likely silent wrong result:** A parser can attach a paragraph or table row to the wrong section while still producing valid JSON and a clean-looking tree. I catch this with explicit hierarchy assertions, warnings for skipped numbering, a check for source-order anomalies, and manual comparison against the rendered PDF pages. Table reconstruction can still fail for borderless or merged-cell layouts; I added explicit assertions for the two main tables and documented the unsupported layouts.
+## 8. Decision Log
 
-**2. Simplicity chosen over correctness:** The JSON generation store and section-number identity matcher are simpler than a transactional document database and semantic entity resolution. Production would first break under concurrent generation writes or source renumbering; the JSON store could lose concurrent updates, while renumbered sections could become unresolved or incorrectly appear new.
+### 1. Most likely silent wrong result
+**What is the most likely way this parser could silently produce a wrong result without throwing an error, and what did you do to prevent or catch it?**
 
-**3. Unhandled input:** A scanned PDF page whose text layer is empty and whose Tesseract installation is missing or broken cannot be extracted reliably. The parser emits a warning when OCR is unavailable; for a real regulatory workflow, ingestion should fail closed or require manual verification instead of treating the result as complete. Another known boundary is duplicate section numbers, which are not safely disambiguated by the current matcher.
+*Answer:*
+The most dangerous failure mode is **silent hierarchy misattribution** — when a paragraph, table cell, or safety requirement is incorrectly attached to a preceding section or preamble because a heading wasn't recognized, or when list items (such as the 5 clinical classification levels under `3.3`) are misclassified as new top-level sections `1` through `5`. The JSON tree would look completely valid, but QA test generation would query the wrong requirements or miss safety constraints entirely.
 
-## 10. What I would do with more time
+To prevent this:
+1. Heading detection combines regex section numbers with visual layout weight (bold spans and font size $\ge 12\text{pt}$), ensuring body list items like `1. Normal` are never promoted to root nodes.
+2. The tree constructor validates ancestor-child levels; when a level is skipped (`2.1.1.1` skipping `2.1.1`), it attaches to the nearest ancestor and emits an auditable node warning rather than guessing an imaginary parent.
+3. Source order anomalies (Section `3.4` before `3.3`) are explicitly flagged with warnings rather than silently sorted.
+4. Extracted tables are filtered against geometric bounding boxes to eliminate duplicate fragments.
+5. Automated test `test_numbered_lists_preserved_as_body_not_nodes` verifies that top-level sections remain strictly `1` through `8`.
 
-- Add page-level OCR confidence and a visual review report for low-confidence pages.
-- Extend table extraction to borderless tables and merged cells, then validate table cells against rendered page images.
-- Add migration and rollback tests, API integration tests for all endpoints, and concurrency tests for generation persistence.
-- Replace JSON file storage with MongoDB or another transactional document store if multiple workers are used.
-- Add reviewable semantic change classification for numerical thresholds and safety-critical modal language, without replacing human approval.
-- Add a richer node lifecycle (`added`, `changed`, `unchanged`, `removed`, `unresolved`) to version comparison output.
+### 2. Simplicity chosen over correctness
+**Where did you choose simplicity over correctness, what is the failure mode, and what would break first in production?**
+
+*Answer:*
+Simplicity was chosen in two key places:
+1. **Section-Number Identity Matching (`SECTION:<num>`):** Logical cross-version identity is tied to explicit section numbering rather than multi-signal semantic entity resolution.
+   - *Failure Mode:* If a document revision renumbers sections (e.g. inserting a new section 3 and shifting all subsequent sections by 1), the matcher will associate section 4 with old section 4 instead of recognizing the shift.
+   - *What breaks first in production:* In an active regulatory engineering environment with major document restructuring or renumbering, historical nodes would match incorrect sections or report false removals. Production requires a composite matcher combining normalized heading similarity, parent-context embedding, and human-in-the-loop review.
+2. **Single-File JSON Generation Storage (`generated.json`):**
+   - *Failure Mode:* While atomic file replace (`.tmp` to `.json`) prevents file corruption on single processes, it lacks row-level locking or distributed transactions.
+   - *What breaks first in production:* Under concurrent multi-user load or multiple Uvicorn worker processes, write collisions will cause lost updates. Production requires PostgreSQL with JSONB columns or MongoDB with transactional locking.
+
+### 3. Unhandled input
+**What inputs or edge cases does your implementation explicitly not handle, and why?**
+
+*Answer:*
+1. **Scanned Images Without Usable OCR:** Scanned PDFs where OCR fails (or where Tesseract is not installed in the host OS) cannot be parsed. The system emits a warning rather than failing silently, but does not attempt computer vision font reconstruction.
+2. **Borderless & Complex Merged Tables:** PyMuPDF's line-based table detector assumes bordered table geometries. Tables without visible grid lines or with multi-column merged headers (spanning rows/columns irregularly) are extracted as raw formatted text lines rather than structured matrices.
+3. **Duplicate Section Numbers Under the Same Parent:** If an author mistakenly numbers two distinct sections identically under the same parent (e.g., two `3.2` sections), the path generator appends an occurrence suffix (`SECTION:3.2::occurrence:2`), but cannot infer which section was the author's intended canonical target without manual human disambiguation.
+
+---
+
+## 9. Remaining Limitations and Future Improvements
+
+With additional time in a production setting, the following capabilities would be added:
+- **Distributed Document Storage:** Replace the file-based generation store with MongoDB or PostgreSQL JSONB with ACID transactions and optimistic concurrency control.
+- **Multi-Signal Semantic Entity Matching:** Combine section number, vector similarity of heading text, tree depth, and sibling context to match moved and renumbered sections.
+- **Vision-Language Table Extraction:** Use multimodal vision models (e.g. Gemini 2.5 Flash) on rendered page pixmaps to validate complex merged-cell tables.
+- **Audit Trail & Signature Workflow:** Implement 21 CFR Part 11 compliant audit logging, version signing, and clinical reviewer sign-off for QA test cases.

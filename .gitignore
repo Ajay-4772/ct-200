@@ -3,5 +3,11 @@ __pycache__/
 .pytest_cache/
 *.py[cod]
 .env
-app/ct200.db
+.env.*
+*.db
+*.sqlite
+*.sqlite3
+generated.json
 app/generated.json
+app/ct200.db
+*.tmp
