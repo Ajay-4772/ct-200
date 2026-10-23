@@ -4,7 +4,10 @@ Conservative by design: uncertain heading patterns remain visible as warnings ra
 from __future__ import annotations
 import hashlib, re, unicodedata
 from pathlib import Path
-import fitz
+try:
+    import pymupdf as fitz
+except ImportError:
+    import fitz
 
 SECTION_RE = re.compile(r'^\s*(\d+(?:\.\d+)*\.?)\s+(.+?)\s*$')
 
@@ -88,7 +91,7 @@ def parse_pdf(path: str | Path) -> dict:
             num, title=m.group(1).rstrip('.'), normalize(m.group(2))
             display_heading=f'{num}. {title}' if '.' not in num else f'{num} {title}'
             node={'section_number':num,'heading':display_heading,'title':title,'level':num.count('.')+1,
-                  'body_text':'','page_start':item['page'],'y_start':item.get('y0',0),'children':[],'tables':[],'node_type':'section','warnings':[]}
+                  'body_text':'','page_start':item['page'],'page_end':item['page'],'y_start':item.get('y0',0),'children':[],'tables':[],'node_type':'section','warnings':[]}
             nodes.append(node); current=node
             # Preserve duplicate headings as distinct nodes and surface them.
             if sum(1 for n in nodes if n['heading'].casefold()==node['heading'].casefold()) > 1:
@@ -96,11 +99,11 @@ def parse_pdf(path: str | Path) -> dict:
             last_page=item['page']; continue
         if current is None:
             if text.lower().startswith('cardiotrack ct-200'):
-                nodes.insert(0, {'section_number':'','heading':text,'title':text,'level':0,'body_text':'','page_start':item['page'],'y_start':item.get('y0',0),'children':[],'tables':[],'node_type':'document_title','warnings':[]})
+                nodes.insert(0, {'section_number':'','heading':text,'title':text,'level':0,'body_text':'','page_start':item['page'],'page_end':item['page'],'y_start':item.get('y0',0),'children':[],'tables':[],'node_type':'document_title','warnings':[]})
                 current=nodes[0]
             else:
                 warnings.append(f'Page {item["page"]}: pre-heading text retained as document preamble: {text[:80]}')
-                nodes.insert(0, {'section_number':'','heading':'Document preamble','title':'Document preamble','level':0,'body_text':text,'page_start':item['page'],'y_start':item.get('y0',0),'children':[],'tables':[],'node_type':'preamble','warnings':[]})
+                nodes.insert(0, {'section_number':'','heading':'Document preamble','title':'Document preamble','level':0,'body_text':text,'page_start':item['page'],'page_end':item['page'],'y_start':item.get('y0',0),'children':[],'tables':[],'node_type':'preamble','warnings':[]})
                 current=nodes[0]
         else:
             # The PDF title wraps across lines; merge title lines instead of treating them as body.
@@ -110,6 +113,12 @@ def parse_pdf(path: str | Path) -> dict:
             else:
                 # Preserve lines and table rows. Do not invent cell boundaries from text extraction.
                 current['body_text']=(current['body_text']+'\n'+text).strip()
+            # Track page continuations across page breaks
+            if item['page'] > current.get('page_start', 1):
+                current['page_end'] = item['page']
+                continuation_warning = f'Page-break continuation: section spans across pages {current["page_start"]}-{item["page"]}.'
+                if continuation_warning not in current['warnings']:
+                    current['warnings'].append(continuation_warning)
         if item['page'] != last_page and current:
             last_page=item['page']
     # Attach detected tables to the closest preceding section heading on the same page.
@@ -165,12 +174,22 @@ def parse_pdf(path: str | Path) -> dict:
     # Warn for known irregularities that should be checked rather than silently normalized.
     order=[n['section_number'] for n in all_nodes]
     if '3.4' in order and '3.3' in order and order.index('3.4') < order.index('3.3'):
-        next(n for n in all_nodes if n['section_number']=='3.4')['warnings'].append('Section 3.4 appears before section 3.3 in source order.')
+        s34 = next((n for n in all_nodes if n['section_number']=='3.4'), None)
+        if s34 and 'Section 3.4 appears before section 3.3 in source order.' not in s34['warnings']:
+            s34['warnings'].append('Section 3.4 appears before section 3.3 in source order.')
     for n in all_nodes:
         if n['section_number']=='2.1.1.1':
-            n['warnings'].append('Numbering skips 2.1.1; attached to nearest existing ancestor 2.1.')
-        if n['section_number']=='3.4' and '3.3' in [x['section_number'] for x in all_nodes[:all_nodes.index(n)]]:
-            n['warnings'].append('Section appears after a later-numbered sibling in source order.')
+            w = 'Numbering skips 2.1.1; attached to nearest existing ancestor 2.1.'
+            if w not in n['warnings']:
+                n['warnings'].append(w)
+        # Deduplicate warnings list preserving order
+        seen = set()
+        deduped = []
+        for w in n['warnings']:
+            if w not in seen:
+                seen.add(w)
+                deduped.append(w)
+        n['warnings'] = deduped
     return {'title':'CardioTrack CT-200 Home Blood Pressure Monitor — Technical & User Manual',
             'nodes':all_nodes,'warnings':warnings,'pages':len(fitz.open(path))}
 

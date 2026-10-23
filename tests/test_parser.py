@@ -50,3 +50,33 @@ def test_specification_and_error_code_tables_are_reconstructed_as_rows():
     assert specs[0]['rows'][1] == ['Measurement method','Oscillometric']
     assert errors and errors[0]['rows'][0] == ['Code','Meaning','Device Behavior']
     assert any(row[0]=='E3' and '2 seconds' in row[2] for row in errors[0]['rows'])
+
+def test_page_break_continuations_detected_and_flagged():
+    parsed_v1 = parse_pdf(V1)
+    sec31 = by_number(parsed_v1, '3.1')
+    assert sec31['page_start'] == 2
+    assert sec31['page_end'] == 3
+    assert any('Page-break continuation' in w for w in sec31['warnings'])
+
+    parsed_v2 = parse_pdf(V2)
+    sec43 = by_number(parsed_v2, '4.3')
+    assert sec43['page_start'] == 4
+    assert sec43['page_end'] == 5
+    assert any('Page-break continuation' in w for w in sec43['warnings'])
+
+def test_multiline_title_merged_into_single_document_title():
+    parsed = parse_pdf(V1)
+    title_node = next(n for n in parsed['nodes'] if n['node_type'] == 'document_title')
+    assert title_node['level'] == 0
+    assert 'CardioTrack CT-200 Home Blood Pressure Monitor' in title_node['heading']
+    assert 'Technical & User Manual' in title_node['heading']
+
+def test_numbered_lists_preserved_as_body_not_nodes():
+    parsed = parse_pdf(V1)
+    sec33 = by_number(parsed, '3.3')
+    assert '1. Normal:' in sec33['body_text']
+    assert '5. Hypertensive Crisis:' in sec33['body_text']
+    # Verify the numbered items under 3.3 did not get falsely created as section nodes
+    top_level = [n['section_number'] for n in parsed['nodes'] if n['level'] == 1]
+    assert top_level == ['1', '2', '3', '4', '5', '6', '7', '8']
+
