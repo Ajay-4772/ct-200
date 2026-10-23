@@ -155,9 +155,10 @@ Run the full suite of unit and integration tests using pytest:
 
 ```powershell
 python -m pytest -v
+# Output: 21 passed
 ```
 
-The test suite covers:
+The test suite contains 21 automated tests covering:
 - **Skipped Numbering Levels:** Section `2.1.1.1` attaching to `2.1` with explicit warning.
 - **Out-of-Order Sibling Sections:** Section `3.4` appearing before `3.3` preserved in source order with warning.
 - **Duplicate Heading Text:** Section `4.2 Error Codes` and `7.1 Error Codes` retained as distinct logical nodes under parents `4` and `7`.
