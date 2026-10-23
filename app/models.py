@@ -32,6 +32,9 @@ class Node(Base):
     tables_json: Mapped[str] = mapped_column(Text, default='[]')
     content_hash: Mapped[str] = mapped_column(String(64), index=True)
     node_type: Mapped[str] = mapped_column(String, default='section')
+    page_start: Mapped[int] = mapped_column(Integer, default=1)
+    page_end: Mapped[int] = mapped_column(Integer, default=1)
+    warnings_json: Mapped[str] = mapped_column(Text, default='[]')
     version: Mapped['DocumentVersion'] = relationship(back_populates='nodes', foreign_keys=[version_id])
 
 class Selection(Base):
