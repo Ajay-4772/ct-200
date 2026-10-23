@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Optional
 import httpx
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Query
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -70,7 +71,7 @@ async def ingest(file: UploadFile=File(...), version: Optional[int]=None, db: Se
         node_id=id_by_key[item['logical_key']]
         parent_id=id_by_key.get(item['parent_logical_key']) if item.get('parent_logical_key') else None
         body=item.get('body_text','').strip()
-        db.add(Node(id=node_id,logical_key=item['logical_key'],version_id=ver.id,parent_id=parent_id,heading=item['heading'],level=item['level'],section_number=item['section_number'],body_text=body,content_hash=sha(item['heading']+'\n'+body),node_type=item['node_type']))
+        db.add(Node(id=node_id,logical_key=item['logical_key'],version_id=ver.id,parent_id=parent_id,heading=item['heading'],level=item['level'],section_number=item['section_number'],body_text=body,tables_json=json.dumps(item.get('tables',[]),ensure_ascii=False),content_hash=sha(item['heading']+'\n'+body),node_type=item['node_type']))
     db.commit()
     return {'document':'CardioTrack CT-200','version':vernum,'version_id':ver.id,'source_sha256':ver.source_sha256,'node_count':len(parsed_nodes),'warnings':parsed['warnings'],'node_warnings':[{'heading':n['heading'],'warnings':n['warnings']} for n in parsed_nodes if n['warnings']], 'matched_logical_nodes':sum(1 for n in parsed_nodes if n['logical_key'] in old_by_key),'changed_existing_nodes':sum(1 for n in parsed_nodes if n['logical_key'] in old_by_key and sha(n['heading']+'\n'+n.get('body_text',''))!=old_by_key[n['logical_key']].content_hash),'parser_pages':parsed['pages']}
 
@@ -86,12 +87,12 @@ def get_version(db, version):
 
 def node_payload(db,n,with_children=True):
     children=db.scalars(select(Node).where(Node.parent_id==n.id)).all() if with_children else []
-    return {'id':n.id,'logical_key':n.logical_key,'version_id':n.version_id,'heading':n.heading,'section_number':n.section_number,'level':n.level,'body_text':n.body_text,'full_text':(n.heading+'\n'+n.body_text).strip(),'content_hash':n.content_hash,'children':[node_payload(db,c,True) for c in children]}
+    return {'id':n.id,'logical_key':n.logical_key,'version_id':n.version_id,'heading':n.heading,'section_number':n.section_number,'level':n.level,'body_text':n.body_text,'full_text':(n.heading+'\n'+n.body_text).strip(),'content_hash':n.content_hash,'tables':json.loads(n.tables_json or '[]'),'children':[node_payload(db,c,True) for c in children]}
 
 @app.get('/sections')
 def sections(version: Optional[int]=None, db: Session=Depends(get_db)):
     v=get_version(db,version); nodes=db.scalars(select(Node).where(Node.version_id==v.id).order_by(Node.section_number,Node.id)).all(); ids={n.id for n in nodes}
-    return {'version':v.version_number,'sections':[node_payload(db,n,False) for n in nodes if n.parent_id is None or n.parent_id not in ids and n.level<=1]}
+    return {'version':v.version_number,'sections':[node_payload(db,n,False) for n in nodes if n.level==1]}
 
 @app.get('/nodes/{node_id}')
 def get_node(node_id:str,db:Session=Depends(get_db)):
@@ -157,20 +158,20 @@ async def call_llm(source_text):
             last_error=f'{type(e).__name__}: {e}'
     raise HTTPException(502,f'LLM output failed validation after 2 attempts; nothing was saved. Details: {last_error[:300]}')
 
-@app.post('/selections/{selection_id}/generate',status_code=201)
+@app.post('/selections/{selection_id}/generate')
 async def generate(selection_id:str,force_new:bool=False,db:Session=Depends(get_db)):
     sel=db.get(Selection,selection_id)
     if not sel: raise HTTPException(404,'Selection not found.')
     stored=read_generations()
     # Idempotent policy: return existing generation for same pinned selection unless force_new=true.
     existing=[g for g in stored if g['selection_id']==selection_id]
-    if existing and not force_new: return {'policy':'idempotent','generation':existing[-1]}
+    if existing and not force_new: return JSONResponse(status_code=200,content={'policy':'idempotent','generation':existing[-1]})
     items=db.scalars(select(SelectionItem).where(SelectionItem.selection_id==selection_id)).all()
     source='\n\n--- SELECTED NODE ---\n\n'.join(i.source_text for i in items)
     output,attempts=await call_llm(source)
     gen={'generation_id':'gen_'+uuid.uuid4().hex[:16],'selection_id':selection_id,'document_version_id':sel.document_version_id,'created_at':datetime.now(timezone.utc).isoformat(),'source_nodes':[{'node_id':i.node_id,'version_id':i.version_id,'source_hash':i.source_hash,'source_text':i.source_text} for i in items],'test_cases':output['test_cases'],'validation':'passed','llm_attempts':attempts}
     stored.append(gen); write_generations(stored)
-    return {'policy':'new_generation','generation':gen}
+    return JSONResponse(status_code=201,content={'policy':'new_generation','generation':gen})
 
 def generation_status(gen,db):
     latest=get_version(db,None); statuses=[]

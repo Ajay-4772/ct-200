@@ -40,3 +40,13 @@ def test_v2_adds_error_code_and_data_export_sections():
     assert '5.3' in numbers
     assert '4.2' in numbers
     assert '4.2' in numbers and '5.3' in numbers
+
+
+def test_specification_and_error_code_tables_are_reconstructed_as_rows():
+    parsed=parse_pdf(V1)
+    specs=by_number(parsed,'2.1')['tables']
+    errors=by_number(parsed,'4.2')['tables']
+    assert specs and specs[0]['rows'][0] == ['Parameter','Value']
+    assert specs[0]['rows'][1] == ['Measurement method','Oscillometric']
+    assert errors and errors[0]['rows'][0] == ['Code','Meaning','Device Behavior']
+    assert any(row[0]=='E3' and '2 seconds' in row[2] for row in errors[0]['rows'])

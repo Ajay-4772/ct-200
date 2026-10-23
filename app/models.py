@@ -29,6 +29,7 @@ class Node(Base):
     level: Mapped[int] = mapped_column(Integer)
     section_number: Mapped[str] = mapped_column(String, default='')
     body_text: Mapped[str] = mapped_column(Text, default='')
+    tables_json: Mapped[str] = mapped_column(Text, default='[]')
     content_hash: Mapped[str] = mapped_column(String(64), index=True)
     node_type: Mapped[str] = mapped_column(String, default='section')
     version: Mapped['DocumentVersion'] = relationship(back_populates='nodes', foreign_keys=[version_id])
